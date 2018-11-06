@@ -1,0 +1,10 @@
+language: minimal
+
+branches:
+  only:
+    - master
+
+jobs:
+  include:
+    - stage: Infrastructure
+      script: ./handle_infrastructure_changes.sh

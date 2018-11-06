@@ -1,0 +1,428 @@
+# VPC setup adapted from https://docs.aws.amazon.com/codebuild/latest/userguide/cloudformation-vpc-template.html.
+# Custom resource for ALB redirection from https://github.com/jheller/alb-rule
+
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Infrastructure for Decision Maker.
+
+Parameters:
+  PrimaryAvailabilityZone:
+    Description: The primary AZ, containing single-AZ resources
+    Type: String
+    Default: us-east-1a
+  SecondaryAvailabilityZone:
+    Description: The secondary AZ, for resources that need more than 1 AZ
+    Type: String
+    Default: us-east-1b
+  EnvironmentName:
+    Description: An environment name to be prefixed to resource names.
+    Type: String
+    Default: decision-maker
+  VpcCIDR:
+    Description: CIDR IP range for the VPC
+    Type: String
+    Default: 10.0.0.0/16
+  PrimaryPublicSubnetCIDR:
+    Description: CIDR IP range for the primary public subnet hosting the resources
+    Type: String
+    Default: 10.0.0.0/24
+  SecondaryPublicSubnetCIDR:
+    Description: CIDR IP range for the secondary public subnet, in the secondary AZ
+    Type: String
+    Default: 10.0.1.0/24
+  DomainName:
+    Description: The root domain name for hosting these resources
+    Type: String
+    Default: decisionmakeronline.com
+  DomainCertARN:
+    Description: ARN of a wildcard cert for the domain name.
+    Type: String
+  KeypairName:
+    Description: Name of a previously-existing SSH keypair for accessing the container host.
+    Type: String
+    Default: decision_maker_ssh
+  LocalAccessIP:
+    Description: IP of a local machine that can access the container host and database.
+    Type: String
+    Default: '72.186.120.238'
+  DBRootPassword:
+    Description: Root password for the database. Should be injected during deployment.
+    Type: String
+    NoEcho: true
+  ProductionTargetPort:
+    Description: Port to access the container for the production site.
+    Type: String
+    Default: '3000'
+  TestTargetPort:
+    Description: Port to access the container for the test site.
+    Type: String
+    Default: '4000'
+  LambdaBucket:
+    Description: S3 Bucket with the code from https://github.com/jheller/alb-rule for the ALB redirection custom resource
+    Type: String
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PrimaryPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref PrimaryAvailabilityZone
+      CidrBlock: !Ref PrimaryPublicSubnetCIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Primary Public Subnet
+  SecondaryPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref SecondaryAvailabilityZone
+      CidrBlock: !Ref SecondaryPublicSubnetCIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Secondary Public Subnet
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Routes
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PrimaryPublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrimaryPublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  SecondaryPublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SecondaryPublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  ContainerHostInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      KeyName: !Ref KeypairName
+      ImageId: ami-0ac019f4fcb7cb7e6 # Ubuntu 18.04, us-east-1
+      InstanceType: t2.micro
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30 # max for free tier
+      SecurityGroupIds:
+        - !GetAtt ContainerHostSecurityGroup.GroupId
+      SubnetId: !Ref PrimaryPublicSubnet
+      # install Docker, use docker run hello-world with -e to make sure docker's up and running
+      UserData: !Base64 |
+        #!/bin/bash -ex
+        wget https://download.docker.com/linux/ubuntu/dists/bionic/pool/stable/amd64/docker-ce_18.06.1~ce~3-0~ubuntu_amd64.deb -O /tmp/docker.deb
+        sudo apt-get install -y libltdl7 # Necessary dependency
+        sudo dpkg -i /tmp/docker.deb
+        sudo docker run hello-world
+      IamInstanceProfile: !Ref ContainerHostProfile
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Container Host
+  ContainerHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: Container Host security group
+      GroupDescription: Allows SSH from local dev machine, HTTP from load balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Sub ${LocalAccessIP}/32
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: Container Host security group
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${EnvironmentName}-alb
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PrimaryPublicSubnet
+        - !Ref SecondaryPublicSubnet
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ProdTargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ProdTargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref DomainCertARN
+  ProdTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-prod-tg
+      Port: !Ref ProductionTargetPort
+      Protocol: HTTP
+      Targets:
+        - Id: !Ref ContainerHostInstance
+          Port: !Ref ProductionTargetPort
+      VpcId: !Ref VPC
+      HealthCheckPath: /
+      HealthCheckPort: !Ref ProductionTargetPort
+      HealthCheckIntervalSeconds: 10
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      Matcher:
+        HttpCode: '200'
+      UnhealthyThresholdCount: 2
+  TestTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-test-tg
+      Port: !Ref TestTargetPort
+      Protocol: HTTP
+      Targets:
+        - Id: !Ref ContainerHostInstance
+          Port: !Ref TestTargetPort
+      VpcId: !Ref VPC
+      HealthCheckPath: /
+      HealthCheckPort: !Ref TestTargetPort
+      HealthCheckIntervalSeconds: 10
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      Matcher:
+        HttpCode: '200'
+      UnhealthyThresholdCount: 2
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ALB security group
+      GroupDescription: Allows HTTP/HTTPS from anywhere
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ALB security group
+  # IAM role for the Lambda function used for implementing the custom redirection resource
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyName: AddALBRules
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - elasticloadbalancing:CreateRule
+                  - elasticloadbalancing:DescribeRules
+                  - elasticloadbalancing:DeleteRule
+                Resource: '*'
+  # Lambda that backs the custom resource for managing ALB redirect rules
+  ALBRuleLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Sets ALB listener rules, including redirect rules that aren't yet available in CloudFormation.
+      FunctionName: AlbListenerRule
+      Handler: alb_rule.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python2.7
+      Timeout: '60'
+      Code:
+        S3Bucket: !Ref LambdaBucket
+        S3Key: AlbListenerRule.zip
+  HTTPSRedirectRule:
+    Type: Custom::AlbListenerRule
+    Properties:
+      ServiceToken: !GetAtt ALBRuleLambda.Arn
+      Conditions:
+        - Field: host-header
+          Values:
+            - '*.*'
+      Actions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: 443
+            StatusCode: HTTP_301
+      ListenerArn: !Ref HTTPListener
+      Priority: 10
+  ApexToWWWRedirectRule:
+    Type: Custom::AlbListenerRule
+    Properties:
+      ServiceToken: !GetAtt ALBRuleLambda.Arn
+      Conditions:
+        - Field: host-header
+          Values:
+            - !Ref DomainName
+      Actions:
+        - Type: redirect
+          RedirectConfig:
+            Host: !Sub www.${DomainName}
+            StatusCode: HTTP_301
+      ListenerArn: !Ref HTTPSListener
+      Priority: 10
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: '20' # max for free tier
+      DBInstanceClass: db.t2.micro
+      AutoMinorVersionUpgrade: true
+      AvailabilityZone: !Ref PrimaryAvailabilityZone
+      BackupRetentionPeriod: '1'
+      DBInstanceIdentifier: DecisionMakerDB
+      DBName: DecisionMakerDB
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      Engine: mysql
+      EngineVersion: '5.7.23'
+      MasterUsername: dbadmin
+      MasterUserPassword: !Ref DBRootPassword
+      MultiAZ: false
+      Port: '3306'
+      PubliclyAccessible: true
+      StorageEncrypted: false
+      StorageType: gp2
+      VPCSecurityGroups:
+        - !GetAtt DatabaseSecurityGroup.GroupId
+    DependsOn: VPC # Necessary because it's getting a public IP address in the VPC
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for the database
+      SubnetIds:
+        - !Ref PrimaryPublicSubnet
+        - !Ref SecondaryPublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} DB subnet group
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: DB security group
+      GroupDescription: Allows MySQL access from local dev machine, container host
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Sub ${LocalAccessIP}/32
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Sub ${ContainerHostInstance.PublicIp}/32
+      Tags:
+        - Key: Name
+          Value: DB security group
+  DNSRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Sub ${DomainName}. 
+      RecordSets: 
+      - Name: !Sub test.${DomainName}. # test site
+        Type: A
+        AliasTarget:
+          HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+          DNSName: !GetAtt LoadBalancer.DNSName
+      - Name: !Sub www.${DomainName}. # production site
+        Type: A
+        AliasTarget:
+          HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+          DNSName: !GetAtt LoadBalancer.DNSName
+      - Name: !Sub ${DomainName}. # apex record aliases to production site
+        Type: A
+        AliasTarget:        # should be the same details as www.${DomainName}
+          HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+          DNSName: !GetAtt LoadBalancer.DNSName
+      - Name: !Sub ssh.${DomainName}. # convenience for SSHing into container host
+        Type: A
+        TTL: '300'
+        ResourceRecords:
+          - !GetAtt ContainerHostInstance.PublicIp
+  ContainerImageRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: decision-maker-repository
+  ContainerHostRole:    # role for the container host, allowing it to pull Docker images from ECR
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole 
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+  ContainerHostProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ContainerHostRole

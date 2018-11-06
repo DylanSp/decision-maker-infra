@@ -1,0 +1,8 @@
+.vscode/
+
+# personal utility scripts
+travis_lint.sh
+create_changeset.sh
+
+# infrastructure template parameters
+parameters.json
