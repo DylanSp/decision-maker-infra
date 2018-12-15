@@ -161,8 +161,12 @@ Resources:
           ToPort: 22
           CidrIp: !Sub ${LocalAccessIP}/32
         - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
+          FromPort: !Ref ProductionTargetPort
+          ToPort: !Ref ProductionTargetPort
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+        - IpProtocol: tcp
+          FromPort: !Ref TestTargetPort
+          ToPort: !Ref TestTargetPort
           SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
       Tags:
         - Key: Name
