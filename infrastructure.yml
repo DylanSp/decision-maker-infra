@@ -404,7 +404,7 @@ Resources:
   ContainerImageRepo:
     Type: AWS::ECR::Repository
     Properties:
-      RepositoryName: decision-maker-repository
+      RepositoryName: decision-maker
   ContainerHostRole:    # role for the container host, allowing it to pull Docker images from ECR
     Type: AWS::IAM::Role
     Properties:
