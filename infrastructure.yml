@@ -330,7 +330,8 @@ Resources:
     Properties:
       Conditions:
         - Field: host-header
-          Values: test.decisionmakeronline.com
+          Values:
+            - !Sub test.${DomainName}
       Actions:
         - Type: forward
           TargetGroupArn: !Ref TestTargetGroup
