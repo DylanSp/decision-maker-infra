@@ -325,6 +325,17 @@ Resources:
             StatusCode: HTTP_301
       ListenerArn: !Ref HTTPSListener
       Priority: 10
+  TestSiteListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Conditions:
+        - Field: host-header
+          Values: test.decisionmakeronline.com
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TestTargetGroup
+      ListenerArn: !Ref HTTPSListener
+      Priority: 20
   DatabaseInstance:
     Type: AWS::RDS::DBInstance
     Properties:
